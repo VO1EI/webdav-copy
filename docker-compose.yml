@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: webdav-smb-backend
+    restart: unless-stopped
+    volumes:
+      - app-data:/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    networks:
+      - app-network
+    # SMB requires host network or specific ports/permissions
+    # Uncomment below if SMB connections fail due to network restrictions
+    # network_mode: host
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: webdav-smb-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+volumes:
+  app-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge
