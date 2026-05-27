@@ -60,7 +60,7 @@ function Btn({ onClick, children, variant="primary", size="md", disabled, classN
   const base = "inline-flex items-center gap-1.5 font-medium rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed select-none";
   const v = { primary:"bg-[#00d4aa] hover:bg-[#00bfa0] text-black", secondary:"bg-white/8 hover:bg-white/12 border border-white/10 text-white", danger:"bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 text-red-400", ghost:"hover:bg-white/8 text-white/50 hover:text-white" };
   const s = { sm:"px-2.5 py-1.5 text-xs", md:"px-4 py-2 text-sm", lg:"px-5 py-2.5 text-base" };
-  return <button onClick={onClick} disabled={disabled} className={cn(base,v[variant]||v.secondary,s[size],className)}>{children}</button>;
+  return <button type="button" onClick={onClick} disabled={disabled} className={cn(base,v[variant]||v.secondary,s[size],className)}>{children}</button>;
 }
 
 function Input({ label, value, onChange, type="text", placeholder, className }) {
@@ -81,7 +81,7 @@ function Modal({ open, onClose, title, children, wide }) {
       <div className={cn("relative bg-[#0d1117] border border-white/10 rounded-2xl shadow-2xl flex flex-col", wide ? "w-full max-w-4xl max-h-[90vh]" : "w-full max-w-lg")}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-white/8 shrink-0">
           <h2 className="text-white font-semibold text-base">{title}</h2>
-          <button onClick={onClose} className="text-white/30 hover:text-white text-xl leading-none transition-colors">×</button>
+          <button type="button" onClick={onClose} className="text-white/30 hover:text-white text-xl leading-none transition-colors">×</button>
         </div>
         <div className="overflow-y-auto flex-1 p-6">{children}</div>
       </div>
@@ -97,13 +97,13 @@ function FileBrowser({ title, items, loading, error, currentPath, onNavigate, on
     <div className="flex flex-col h-full min-h-0">
       {/* Breadcrumb */}
       <div className="flex items-center gap-1 px-1 py-2 shrink-0 flex-wrap">
-        <button onClick={() => onNavigate('/')} className="text-[#00d4aa] hover:text-[#00bfa0] text-xs transition-colors">root</button>
+        <button type="button" onClick={() => onNavigate('/')} className="text-[#00d4aa] hover:text-[#00bfa0] text-xs transition-colors">root</button>
         {pathParts.map((part, i) => {
           const to = '/' + pathParts.slice(0, i+1).join('/');
           return (
             <span key={i} className="flex items-center gap-1">
               <span className="text-white/20 text-xs">/</span>
-              <button onClick={() => onNavigate(to)} className="text-[#00d4aa] hover:text-[#00bfa0] text-xs transition-colors">{part}</button>
+              <button type="button" onClick={() => onNavigate(to)} className="text-[#00d4aa] hover:text-[#00bfa0] text-xs transition-colors">{part}</button>
             </span>
           );
         })}
@@ -111,10 +111,10 @@ function FileBrowser({ title, items, loading, error, currentPath, onNavigate, on
 
       {/* Back button */}
       {currentPath !== '/' && (
-        <button onClick={() => {
+        <button type="button" onClick={() => {
           const parent = '/' + pathParts.slice(0, -1).join('/');
           onNavigate(parent || '/');
-        }} className="flex items-center gap-2 px-2 py-1.5 text-white/40 hover:text-white/70 text-sm hover:bg-white/5 rounded transition-all mx-1 mb-1">
+        }} className="flex items-center gap-2 px-2 py-1.5 text-white/40 hover:text-white/70 text-sm hover:bg-white/5 rounded transition-all mx-1 mb-1" type="button">
           <span>←</span><span>..</span>
         </button>
       )}
@@ -156,7 +156,7 @@ function FileBrowser({ title, items, loading, error, currentPath, onNavigate, on
       {/* Select current dir */}
       {onSelect && currentPath && (
         <div className="pt-3 shrink-0">
-          <Btn onClick={() => onSelect({ path: currentPath, type: 'directory', name: pathParts[pathParts.length-1] || 'root' })} className="w-full justify-center">
+          <Btn type="button" onClick={() => onSelect({ path: currentPath, type: 'directory', name: pathParts[pathParts.length-1] || 'root' })} className="w-full justify-center">
             Use: {currentPath}
           </Btn>
         </div>
@@ -436,7 +436,7 @@ export default function App() {
         </div>
         <nav className="flex-1 px-3 py-4 space-y-0.5">
           {tabs.map(t => (
-            <button key={t.id} onClick={()=>setTab(t.id)} className={cn("w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all text-left", tab===t.id?"bg-[#00d4aa]/15 text-[#00d4aa] border border-[#00d4aa]/20":"text-white/40 hover:text-white/70 hover:bg-white/5")}>
+            <button type="button" key={t.id} onClick={()=>setTab(t.id)} type="button" className={cn("w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all text-left", tab===t.id?"bg-[#00d4aa]/15 text-[#00d4aa] border border-[#00d4aa]/20":"text-white/40 hover:text-white/70 hover:bg-white/5")}>
               <span>{t.icon}</span>{t.label}
             </button>
           ))}
@@ -784,10 +784,10 @@ export default function App() {
             <div className="space-y-2">
               {Object.entries(FILE_TYPE_PRESETS).map(([preset,exts])=>(
                 <div key={preset}>
-                  <button onClick={()=>togglePreset(exts)} className={cn("text-xs px-2 py-1 rounded font-medium border transition-all mb-1.5", exts.every(e=>jobForm.fileTypes.includes(e))?"bg-[#00d4aa]/20 border-[#00d4aa]/40 text-[#00d4aa]":"bg-white/5 border-white/10 text-white/40 hover:text-white/60")}>{preset}</button>
+                  <button type="button" onClick={()=>togglePreset(exts)} className={cn("text-xs px-2 py-1 rounded font-medium border transition-all mb-1.5", exts.every(e=>jobForm.fileTypes.includes(e))?"bg-[#00d4aa]/20 border-[#00d4aa]/40 text-[#00d4aa]":"bg-white/5 border-white/10 text-white/40 hover:text-white/60")}>{preset}</button>
                   <div className="flex flex-wrap gap-1">
                     {exts.map(ext=>(
-                      <button key={ext} onClick={()=>toggleFileType(ext)} className={cn("text-xs px-2 py-0.5 rounded border transition-all", jobForm.fileTypes.includes(ext)?"bg-[#00d4aa]/15 border-[#00d4aa]/30 text-[#00d4aa]":"bg-white/3 border-white/8 text-white/30 hover:text-white/60")}>.{ext}</button>
+                      <button type="button" key={ext} onClick={()=>toggleFileType(ext)} className={cn("text-xs px-2 py-0.5 rounded border transition-all", jobForm.fileTypes.includes(ext)?"bg-[#00d4aa]/15 border-[#00d4aa]/30 text-[#00d4aa]":"bg-white/3 border-white/8 text-white/30 hover:text-white/60")}>.{ext}</button>
                     ))}
                   </div>
                 </div>
@@ -802,7 +802,7 @@ export default function App() {
               <div className="flex flex-wrap gap-1 mt-2">
                 {jobForm.fileTypes.map(ext=>(
                   <span key={ext} className="inline-flex items-center gap-1 bg-[#00d4aa]/10 border border-[#00d4aa]/20 text-[#00d4aa] text-xs px-2 py-0.5 rounded-full">
-                    .{ext}<button onClick={()=>toggleFileType(ext)} className="opacity-60 hover:opacity-100">×</button>
+                    .{ext}<button type="button" onClick={()=>toggleFileType(ext)} className="opacity-60 hover:opacity-100">×</button>
                   </span>
                 ))}
               </div>
@@ -815,7 +815,7 @@ export default function App() {
             <label className="text-xs text-white/40 uppercase tracking-widest font-medium block mb-2">Schedule</label>
             <div className="grid grid-cols-3 gap-1.5 mb-2">
               {INTERVAL_PRESETS.filter(p => p.key !== "custom").map(p => (
-                <button key={p.key} onClick={()=>{ setJobForm(prev=>({...prev, schedule: p.key})); if(p.key !== "manual") setCronInput(""); }}
+                <button type="button" key={p.key} onClick={()=>{ setJobForm(prev=>({...prev, schedule: p.key})); if(p.key !== "manual") setCronInput(""); }}
                   className={cn("flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs transition-all",
                     jobForm.schedule===p.key
                       ? "bg-[#00d4aa]/15 border-[#00d4aa]/40 text-[#00d4aa]"
@@ -825,7 +825,7 @@ export default function App() {
                 </button>
               ))}
               {/* Custom cron button */}
-              <button onClick={()=>setJobForm(prev=>({...prev, schedule: cronInput || "custom"}))}
+              <button type="button" onClick={()=>setJobForm(prev=>({...prev, schedule: cronInput || "custom"}))}
                 className={cn("flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs transition-all",
                   !INTERVAL_PRESETS.find(p=>p.key===jobForm.schedule) && jobForm.schedule !== "manual"
                     ? "bg-[#00d4aa]/15 border-[#00d4aa]/40 text-[#00d4aa]"
@@ -851,7 +851,7 @@ export default function App() {
                 </div>
                 {cronValid===true && <p className="text-emerald-400 text-xs">✓ Valid cron expression</p>}
                 {cronValid===false && <p className="text-red-400 text-xs">✗ Invalid cron expression</p>}
-                <p className="text-white/20 text-xs">Format: minute hour day month weekday  ·  <a href="https://crontab.guru" target="_blank" rel="noreferrer" className="text-[#00d4aa]/50 hover:text-[#00d4aa]">crontab.guru ↗</a></p>
+                <p className="text-white/20 text-xs">Format: minute hour day month weekday  ·  <span className="text-[#00d4aa]/40">crontab.guru</span></p>
               </div>
             )}
           </div>

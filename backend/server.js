@@ -397,24 +397,97 @@ async function runSyncJob(jobId) {
     const smbMkdir = promisify(smb2.mkdir.bind(smb2));
     const smbExists = (p) => smbOp(cb => smb2.exists(p, cb), 8000).then(r => !!r).catch(() => false);
 
-    const allowedExts = (job.fileTypes || []).map(e => e.toLowerCase().replace(/^\./, ''));
+    const allowedExts = (job.fileTypes || []).map(e => e.toLowerCase().replace(/^\\./, ''));
+
+    // Check if a directory tree contains any files that pass the filter.
+    // Used to decide whether to bother creating the folder on the SMB side.
+    async function treeHasMatchingFiles(davPath) {
+      let contents;
+      try { contents = await webdavClient.getDirectoryContents(davPath); }
+      catch (_) { return false; }
+      for (const item of contents) {
+        if (item.type === 'file') {
+          if (allowedExts.length === 0) return true;
+          const ext = item.basename.split('.').pop()?.toLowerCase() || '';
+          if (allowedExts.includes(ext)) return true;
+        } else if (item.type === 'directory') {
+          if (await treeHasMatchingFiles(item.filename)) return true;
+        }
+      }
+      return false;
+    }
+
+    // Ensure all segments of an SMB path exist, creating missing ones.
+    // e.g. "Movies\Action\2024" creates each level if absent.
+    const madeSmb = new Set();
+    async function ensureSmbPath(smbPath) {
+      if (!smbPath || madeSmb.has(smbPath)) return;
+      const segments = smbPath.split('\\').filter(Boolean);
+      let built = '';
+      for (const seg of segments) {
+        built = built ? `${built}\\${seg}` : seg;
+        if (madeSmb.has(built)) continue;
+        try {
+          const exists = await smbExists(built);
+          if (!exists) {
+            await smbMkdir(built).catch(err => {
+              // Ignore "already exists" races
+              if (!err.message?.includes('exist')) throw err;
+            });
+            addLog(`Created folder: ${built}`, 'debug');
+          }
+          madeSmb.add(built);
+        } catch (err) {
+          addLog(`Warning: could not create folder ${built}: ${err.message}`, 'warn');
+          madeSmb.add(built); // don't retry endlessly
+        }
+      }
+    }
 
     async function syncDir(davPath, smbPath) {
-      const contents = await webdavClient.getDirectoryContents(davPath);
+      let contents;
+      try {
+        contents = await webdavClient.getDirectoryContents(davPath);
+      } catch (e) {
+        addLog(`Cannot read WebDAV path ${davPath}: ${e.message}`, 'error');
+        errors++;
+        return;
+      }
+
       for (const item of contents) {
+        // Build the SMB destination path for this item
         const itemSmbPath = smbPath ? `${smbPath}\\${item.basename}` : item.basename;
-        if (item.type === 'directory' && job.recursive) {
-          try {
-            const exists = await smbExists(itemSmbPath);
-            if (!exists) await smbMkdir(itemSmbPath).catch(() => {});
-          } catch (_) {}
+
+        if (item.type === 'directory') {
+          if (!job.recursive) continue;
+
+          // Only create the directory if it contains (recursively) at least one
+          // file that passes the filter — avoids creating empty ghost folders.
+          const hasFiles = allowedExts.length === 0
+            ? true  // no filter → always mirror structure
+            : await treeHasMatchingFiles(item.filename);
+
+          if (!hasFiles) {
+            addLog(`Skipping empty/filtered folder: ${item.filename}`, 'debug');
+            continue;
+          }
+
+          await ensureSmbPath(itemSmbPath);
           await syncDir(item.filename, itemSmbPath);
+
         } else if (item.type === 'file') {
           const ext = item.basename.split('.').pop()?.toLowerCase() || '';
           if (allowedExts.length > 0 && !allowedExts.includes(ext)) continue;
+
+          // Ensure the parent directory chain exists before writing
+          if (smbPath) await ensureSmbPath(smbPath);
+
           try {
             const exists = await smbExists(itemSmbPath);
-            if (exists && !job.overwrite) { addLog(`Skipping (exists): ${item.filename}`, 'debug'); continue; }
+            if (exists && !job.overwrite) {
+              addLog(`Skipping (exists): ${item.filename}`, 'debug');
+              continue;
+            }
             addLog(`Copying: ${item.filename} → \\\\${smbShareCfg.host}\\${smbShareCfg.share}\\${itemSmbPath}`, 'info');
             broadcast({ type: 'progress', data: { jobId, file: item.filename } });
             const buf = await webdavClient.getFileContents(item.filename);
