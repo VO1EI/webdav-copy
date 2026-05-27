@@ -1,11 +1,11 @@
 FROM node:20-alpine
 
-# Install samba-client for SMB support
+# smbclient for reliable SMB testing & browsing via CLI
 RUN apk add --no-cache samba-client
 
 WORKDIR /app
 COPY package.json .
-RUN npm install
+RUN npm install --omit=dev
 COPY server.js .
 
 RUN mkdir -p /data
