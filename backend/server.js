@@ -100,15 +100,29 @@ function smbOp(fn, timeoutMs = 15000) {
 // The -U flag is "user%pass" ONLY — domain goes in -W, never prepended to -U.
 // The old broken form "WORKGROUP\user%pass" caused the 502 errors.
 function buildSmbArgs(host, share, username, password, domain, command) {
-  const shareStr  = `//${host}/${share}`;
-  // password can be empty — still need the % separator so smbclient doesn't prompt
-  const userStr   = `${username}%${password || ''}`;
-  const domainStr = domain || 'WORKGROUP';
+  // Sanitise inputs — trim whitespace that might sneak in from the UI form
+  const cleanHost   = (host   || '').trim();
+  const cleanShare  = (share  || '').trim();
+  const cleanUser   = (username || '').trim();
+  const cleanPass   = (password || '').toString().trim();
+  const cleanDomain = (domain || 'WORKGROUP').trim();
+
+  if (!cleanHost)  throw new Error('Host is required');
+  if (!cleanShare) throw new Error('Share name is required');
+
+  const shareStr = `//${cleanHost}/${cleanShare}`;
+  // "user%pass" — the % separator stops smbclient from prompting interactively
+  const userStr  = `${cleanUser}%${cleanPass}`;
+
+  console.log('[smbclient] share path:', shareStr, '| user:', cleanUser, '| domain:', cleanDomain);
+
   return [
     shareStr,
     '-U', userStr,
-    '-W', domainStr,
-    '--option=client min protocol=NT1',  // broader NAS compat (Synology, QNAP, TrueNAS, older Samba)
+    '-W', cleanDomain,
+    // NOTE: '--option=X Y' with a space MUST be two separate args when using execFile
+    '--option', 'client min protocol=NT1',
+    '-t', '10',          // socket timeout in seconds
     '-c', command,
   ];
 }
@@ -282,6 +296,11 @@ app.delete('/api/smb/:id', (req, res) => {
 // Test SMB — uses smbclient CLI, much more reliable than the Node lib for testing
 app.post('/api/smb/test', async (req, res) => {
   const { host, share, username, password, domain, id } = req.body;
+  // Debug: log exactly what we received (password redacted)
+  console.log('[smb/test] received:', { host, share, username, domain, id, password: password ? '***' : '(empty)' });
+  if (!host || !share) {
+    return res.json({ success: false, message: `Missing required field: ${!host ? 'host' : 'share name'}` });
+  }
   try {
     const result = await testSmbViaCli(host, share, username, password, domain);
     // Persist the status
