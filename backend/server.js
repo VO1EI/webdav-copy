@@ -94,16 +94,54 @@ function smbOp(fn, timeoutMs = 15000) {
   });
 }
 
-// ── SMB: test connection via smbclient CLI (most reliable) ────────────────────
+// ── SMB: build smbclient args correctly ───────────────────────────────────────
+// Correct smbclient format:
+//   smbclient //host/share -U "username%password" -W DOMAIN -c "command"
+// The -U flag is "user%pass" ONLY — domain goes in -W, never prepended to -U.
+// The old broken form "WORKGROUP\user%pass" caused the 502 errors.
+function buildSmbArgs(host, share, username, password, domain, command) {
+  const shareStr  = `//${host}/${share}`;
+  // password can be empty — still need the % separator so smbclient doesn't prompt
+  const userStr   = `${username}%${password || ''}`;
+  const domainStr = domain || 'WORKGROUP';
+  return [
+    shareStr,
+    '-U', userStr,
+    '-W', domainStr,
+    '--option=client min protocol=NT1',  // broader NAS compat (Synology, QNAP, TrueNAS, older Samba)
+    '-c', command,
+  ];
+}
+
+// Extract the most useful error line from smbclient stderr
+function parseSmbError(stderr, fallback) {
+  if (!stderr) return fallback;
+  const lines = stderr.split('\n').map(l => l.trim()).filter(Boolean);
+  const hit = lines.find(l =>
+    l.includes('NT_STATUS') ||
+    l.includes('Connection refused') ||
+    l.includes('No route') ||
+    l.includes('timed out') ||
+    l.includes('LOGON_FAILURE') ||
+    l.includes('Bad password') ||
+    l.includes('Access denied') ||
+    l.includes('Cannot connect')
+  );
+  return hit || lines[lines.length - 1] || fallback;
+}
+
+// ── SMB: test connection via smbclient CLI ────────────────────────────────────
 function testSmbViaCli(host, share, username, password, domain) {
   return new Promise((resolve) => {
-    const domainStr = domain || 'WORKGROUP';
-    const shareStr = `//${host}/${share}`;
-    const args = [shareStr, '-U', `${domainStr}\\${username}%${password}`, '-c', 'ls'];
-    execFile('smbclient', args, { timeout: 12000 }, (err, stdout, stderr) => {
+    const args = buildSmbArgs(host, share, username, password, domain, 'ls');
+    // Log with password redacted
+    const display = args.map((a, i) => (i > 0 && args[i-1] === '-U') ? a.replace(/%.*/, '%***') : a);
+    console.log('[smbclient test] smbclient', display.join(' '));
+    execFile('smbclient', args, { timeout: 15000 }, (err, stdout, stderr) => {
       if (err) {
-        const msg = stderr || err.message || 'Unknown SMB error';
-        resolve({ success: false, message: msg.split('\n')[0].trim() });
+        const msg = parseSmbError(stderr, err.message);
+        console.error('[smbclient test error]', msg);
+        resolve({ success: false, message: msg });
       } else {
         resolve({ success: true, message: 'Connected successfully' });
       }
@@ -114,29 +152,28 @@ function testSmbViaCli(host, share, username, password, domain) {
 // ── SMB: browse via smbclient CLI ─────────────────────────────────────────────
 function browseSmbViaCli(host, share, username, password, domain, dirPath) {
   return new Promise((resolve) => {
-    const domainStr = domain || 'WORKGROUP';
-    const shareStr = `//${host}/${share}`;
-    const cdCmd = dirPath && dirPath !== '/' && dirPath !== ''
-      ? `cd "${dirPath.replace(/\//g, '\\').replace(/^\\/, '')}"; ls`
-      : 'ls';
-    const args = [shareStr, '-U', `${domainStr}\\${username}%${password}`, '-c', cdCmd];
-    execFile('smbclient', args, { timeout: 15000 }, (err, stdout, stderr) => {
+    // Normalise path: strip leading slash, convert / to \ for smbclient cd command
+    const normalised = (dirPath || '/').replace(/^\//, '').replace(/\//g, '\\');
+    const cmd = normalised ? `cd "${normalised}"; ls` : 'ls';
+    const args = buildSmbArgs(host, share, username, password, domain, cmd);
+    execFile('smbclient', args, { timeout: 20000 }, (err, stdout, stderr) => {
       if (err) {
-        resolve({ success: false, message: (stderr || err.message).split('\n')[0].trim(), contents: [] });
+        const msg = parseSmbError(stderr, err.message);
+        console.error('[smbclient browse error]', msg);
+        resolve({ success: false, message: msg, contents: [] });
         return;
       }
-      // Parse smbclient ls output
+      // Parse smbclient ls output lines, e.g.:
+      //   "  My Folder              D        0  Mon Jan  1 00:00:00 2024"
+      //   "  movie.mkv              A  1234567  Tue Feb  2 12:34:56 2024"
       const items = [];
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        // smbclient ls line: "  filename                D        0  Mon Jan  1 00:00:00 2024"
-        // or                  "  filename.ext            A    12345  Mon Jan  1 00:00:00 2024"
-        const m = line.match(/^\s{2}(.+?)\s+(D|A|H|R|S)\s+(\d+)\s+(.+)$/);
+      for (const line of stdout.split('\n')) {
+        const m = line.match(/^\s{2}(.+?)\s{2,}([DAHRNS]+)\s+(\d+)\s+(.+)$/);
         if (!m) continue;
         const name = m[1].trimEnd();
         if (name === '.' || name === '..') continue;
-        const isDir = m[2] === 'D';
-        const size = parseInt(m[3], 10);
+        const isDir   = m[2].includes('D');
+        const size    = parseInt(m[3], 10);
         const subPath = dirPath && dirPath !== '/'
           ? `${dirPath}/${name}`.replace(/\/+/g, '/')
           : `/${name}`;
