@@ -2,6 +2,25 @@ import { useState, useEffect, useRef, useCallback } from "react";
 
 const API = "/api";
 
+const INTERVAL_PRESETS = [
+  { key: "manual",  label: "Manual only",           icon: "—"  },
+  { key: "15min",   label: "Every 15 minutes",       icon: "⚡" },
+  { key: "30min",   label: "Every 30 minutes",       icon: "🔄" },
+  { key: "1hour",   label: "Every hour",             icon: "🕐" },
+  { key: "3hour",   label: "Every 3 hours",          icon: "🕒" },
+  { key: "6hour",   label: "Every 6 hours",          icon: "🕕" },
+  { key: "12hour",  label: "Every 12 hours",         icon: "🕛" },
+  { key: "24hour",  label: "Every 24 hours (daily)", icon: "📅" },
+  { key: "custom",  label: "Custom cron…",           icon: "⚙️" },
+];
+
+function scheduleLabel(schedule) {
+  if (!schedule || schedule === "manual") return "Manual only";
+  const preset = INTERVAL_PRESETS.find(p => p.key === schedule);
+  if (preset) return preset.label;
+  return `Cron: ${schedule}`;
+}
+
 const FILE_TYPE_PRESETS = {
   "Video":     ["mp4","mkv","avi","mov","wmv","flv","m4v","webm","ts","m2ts"],
   "Audio":     ["mp3","flac","wav","aac","ogg","m4a","opus","wma"],
@@ -195,9 +214,11 @@ export default function App() {
 
   // Forms
   const [smbForm, setSmbForm] = useState({ name:"", host:"", share:"", username:"", password:"", domain:"WORKGROUP" });
-  const [jobForm, setJobForm] = useState({ name:"", smbShareId:"", webdavPath:"/", smbDestPath:"", fileTypes:[], recursive:true, overwrite:false });
+  const [jobForm, setJobForm] = useState({ name:"", smbShareId:"", webdavPath:"/", smbDestPath:"", fileTypes:[], recursive:true, overwrite:false, schedule:"manual" });
   const [webdavForm, setWebdavForm] = useState({ url:"https://webdav.torbox.app", username:"", password:"" });
   const [customExt, setCustomExt] = useState("");
+  const [cronInput, setCronInput] = useState("");
+  const [cronValid, setCronValid] = useState(null);
   const [testStatus, setTestStatus] = useState({});
 
   const showToast = (msg, type="info") => { setToast({msg,type}); setTimeout(()=>setToast(null),3500); };
@@ -375,6 +396,15 @@ export default function App() {
     const r = await fetch(`${API}/jobs/${id}/run`, { method:"POST" });
     const d = await r.json();
     showToast(d.message, d.success?"info":"error");
+  };
+
+  const validateCron = async (expr) => {
+    if (!expr.trim()) { setCronValid(null); return; }
+    try {
+      const r = await fetch(`${API}/cron/validate`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ expr }) });
+      const d = await r.json();
+      setCronValid(d.valid);
+    } catch { setCronValid(false); }
   };
 
   const toggleFileType = (ext) => setJobForm(p => ({ ...p, fileTypes: p.fileTypes.includes(ext) ? p.fileTypes.filter(e=>e!==ext) : [...p.fileTypes, ext] }));
@@ -639,6 +669,7 @@ export default function App() {
                             {job.fileTypes?.length>0 ? job.fileTypes.map(e=><Badge key={e} color="blue">.{e}</Badge>) : <Badge color="slate">All files</Badge>}
                             {job.recursive && <Badge color="slate">Recursive</Badge>}
                             {job.overwrite && <Badge color="yellow">Overwrite</Badge>}
+                            <Badge color={job.schedule && job.schedule!=="manual"?"teal":"slate"}>{scheduleLabel(job.schedule)}</Badge>
                           </div>
                         </div>
                       </div>
@@ -777,6 +808,52 @@ export default function App() {
               </div>
             )}
             {!jobForm.fileTypes.length && <p className="text-white/20 text-xs mt-2">No filter — all file types will be copied.</p>}
+          </div>
+
+          {/* Schedule */}
+          <div>
+            <label className="text-xs text-white/40 uppercase tracking-widest font-medium block mb-2">Schedule</label>
+            <div className="grid grid-cols-3 gap-1.5 mb-2">
+              {INTERVAL_PRESETS.filter(p => p.key !== "custom").map(p => (
+                <button key={p.key} onClick={()=>{ setJobForm(prev=>({...prev, schedule: p.key})); if(p.key !== "manual") setCronInput(""); }}
+                  className={cn("flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs transition-all",
+                    jobForm.schedule===p.key
+                      ? "bg-[#00d4aa]/15 border-[#00d4aa]/40 text-[#00d4aa]"
+                      : "bg-white/3 border-white/8 text-white/40 hover:text-white/70 hover:bg-white/6")}>
+                  <span>{p.icon}</span>
+                  <span className="leading-tight text-center">{p.label}</span>
+                </button>
+              ))}
+              {/* Custom cron button */}
+              <button onClick={()=>setJobForm(prev=>({...prev, schedule: cronInput || "custom"}))}
+                className={cn("flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs transition-all",
+                  !INTERVAL_PRESETS.find(p=>p.key===jobForm.schedule) && jobForm.schedule !== "manual"
+                    ? "bg-[#00d4aa]/15 border-[#00d4aa]/40 text-[#00d4aa]"
+                    : "bg-white/3 border-white/8 text-white/40 hover:text-white/70 hover:bg-white/6")}>
+                <span>⚙️</span>
+                <span>Custom cron</span>
+              </button>
+            </div>
+            {/* Custom cron input — shown when no preset matches */}
+            {(!INTERVAL_PRESETS.find(p=>p.key===jobForm.schedule && p.key!=="custom") || jobForm.schedule==="custom") && (
+              <div className="space-y-1">
+                <div className="flex gap-2">
+                  <input
+                    value={cronInput}
+                    onChange={e=>{ setCronInput(e.target.value); setCronValid(null); }}
+                    onBlur={()=>{ if(cronInput.trim()){ validateCron(cronInput); setJobForm(p=>({...p,schedule:cronInput.trim()})); }}}
+                    placeholder="e.g. 0 2 * * *  (daily at 2am)"
+                    className={cn("flex-1 bg-white/5 border rounded-lg px-3 py-2 text-white text-sm placeholder-white/20 focus:outline-none transition-all",
+                      cronValid===true?"border-emerald-500/50 focus:border-emerald-400":
+                      cronValid===false?"border-red-500/50 focus:border-red-400":
+                      "border-white/10 focus:border-[#00d4aa]/60")} />
+                  <Btn variant="secondary" size="sm" onClick={()=>{ if(cronInput.trim()){ validateCron(cronInput); setJobForm(p=>({...p,schedule:cronInput.trim()})); }}}>Validate</Btn>
+                </div>
+                {cronValid===true && <p className="text-emerald-400 text-xs">✓ Valid cron expression</p>}
+                {cronValid===false && <p className="text-red-400 text-xs">✗ Invalid cron expression</p>}
+                <p className="text-white/20 text-xs">Format: minute hour day month weekday  ·  <a href="https://crontab.guru" target="_blank" rel="noreferrer" className="text-[#00d4aa]/50 hover:text-[#00d4aa]">crontab.guru ↗</a></p>
+              </div>
+            )}
           </div>
 
           {/* Options */}

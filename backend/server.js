@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { promisify } = require('util');
 const { execFile } = require('child_process');
+const cron = require('node-cron');
 
 const app = express();
 app.use(cors());
@@ -59,10 +60,12 @@ function addLog(message, level = 'info') {
   return entry;
 }
 
-// ── SMB helper: create a client with error guard ──────────────────────────────
+// ── SMB helper: create a client ──────────────────────────────────────────────
+// NOTE: @marsaud/smb2 does NOT extend EventEmitter — never call .on() on it.
+// All error handling is via callback err arguments only.
 function createSmbClient(shareInfo) {
   const { host, share, username, password, domain } = shareInfo;
-  const client = new SMB2({
+  return new SMB2({
     share: `\\\\${host}\\${share}`,
     domain: domain || 'WORKGROUP',
     username: username || '',
@@ -70,11 +73,6 @@ function createSmbClient(shareInfo) {
     autoCloseTimeout: 10000,
     packetConcurrency: 4,
   });
-  // Absorb any error events the lib may emit outside of callbacks
-  client.on('error', (err) => {
-    console.error('[smb2 client error]', err.message);
-  });
-  return client;
 }
 
 function closeSmbClient(client) {
@@ -341,6 +339,7 @@ app.post('/api/jobs', (req, res) => {
   const job = { ...req.body, id: Date.now().toString(), status: 'idle', lastRun: null, filesCopied: 0 };
   cfg.syncJobs.push(job);
   saveConfig(cfg);
+  registerJobSchedule(job);
   res.json({ success: true, job });
 });
 
@@ -350,11 +349,13 @@ app.put('/api/jobs/:id', (req, res) => {
   if (idx === -1) return res.json({ success: false, message: 'Not found' });
   cfg.syncJobs[idx] = { ...cfg.syncJobs[idx], ...req.body, id: req.params.id };
   saveConfig(cfg);
+  registerJobSchedule(cfg.syncJobs[idx]);
   res.json({ success: true });
 });
 
 app.delete('/api/jobs/:id', (req, res) => {
   const cfg = loadConfig();
+  unregisterJobSchedule(req.params.id);
   cfg.syncJobs = cfg.syncJobs.filter(j => j.id !== req.params.id);
   saveConfig(cfg);
   res.json({ success: true });
@@ -452,6 +453,167 @@ async function runSyncJob(jobId) {
   }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEDULER
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Interval presets → cron expressions
+const INTERVAL_PRESETS = {
+  '15min':  '*/15 * * * *',
+  '30min':  '*/30 * * * *',
+  '1hour':  '0 * * * *',
+  '3hour':  '0 */3 * * *',
+  '6hour':  '0 */6 * * *',
+  '12hour': '0 */12 * * *',
+  '24hour': '0 0 * * *',
+  'manual': null,
+};
+
+// Map of jobId → node-cron task
+const scheduledTasks = new Map();
+
+function cronExprForJob(job) {
+  if (!job.schedule || job.schedule === 'manual') return null;
+  // If it's a preset key, look it up
+  if (INTERVAL_PRESETS[job.schedule] !== undefined) return INTERVAL_PRESETS[job.schedule];
+  // Otherwise treat it as a raw cron expression
+  return job.schedule;
+}
+
+function describeSchedule(schedule) {
+  const labels = {
+    'manual':  'Manual only',
+    '15min':   'Every 15 minutes',
+    '30min':   'Every 30 minutes',
+    '1hour':   'Every hour',
+    '3hour':   'Every 3 hours',
+    '6hour':   'Every 6 hours',
+    '12hour':  'Every 12 hours',
+    '24hour':  'Every 24 hours (daily)',
+  };
+  return labels[schedule] || `Custom: ${schedule}`;
+}
+
+function registerJobSchedule(job) {
+  // Cancel any existing task for this job
+  if (scheduledTasks.has(job.id)) {
+    try { scheduledTasks.get(job.id).stop(); } catch (_) {}
+    scheduledTasks.delete(job.id);
+  }
+
+  const expr = cronExprForJob(job);
+  if (!expr) return; // manual — nothing to schedule
+
+  if (!cron.validate(expr)) {
+    console.error(`[scheduler] Invalid cron expression for job "${job.name}": ${expr}`);
+    return;
+  }
+
+  const task = cron.schedule(expr, () => {
+    const cfg = loadConfig();
+    const current = cfg.syncJobs.find(j => j.id === job.id);
+    if (!current) { task.stop(); scheduledTasks.delete(job.id); return; }
+    if (current.status === 'running') {
+      addLog(`Skipping scheduled run of "${current.name}" — already running`, 'warn');
+      return;
+    }
+    addLog(`Scheduled run starting: "${current.name}" (${describeSchedule(current.schedule)})`, 'info');
+    runSyncJob(job.id).catch(e => console.error('[scheduler error]', e.message));
+  }, { scheduled: true, timezone: process.env.TZ || 'UTC' });
+
+  scheduledTasks.set(job.id, task);
+  console.log(`[scheduler] Registered "${job.name}" → ${expr}`);
+}
+
+function unregisterJobSchedule(jobId) {
+  if (scheduledTasks.has(jobId)) {
+    try { scheduledTasks.get(jobId).stop(); } catch (_) {}
+    scheduledTasks.delete(jobId);
+    console.log(`[scheduler] Unregistered job ${jobId}`);
+  }
+}
+
+function initScheduler() {
+  const cfg = loadConfig();
+  const jobs = cfg.syncJobs || [];
+  let count = 0;
+
+  for (const job of jobs) {
+    // Reset any stuck 'running' state from before restart
+    if (job.status === 'running') {
+      job.status = 'idle';
+    }
+    registerJobSchedule(job);
+    if (cronExprForJob(job)) count++;
+  }
+
+  // Persist the status reset
+  if (jobs.some(j => j.status === 'idle')) saveConfig(cfg);
+
+  addLog(`Scheduler initialised: ${count} job(s) scheduled`, 'info');
+
+  // Run scheduled jobs immediately on startup
+  for (const job of jobs) {
+    if (cronExprForJob(job)) {
+      addLog(`Startup run: "${job.name}"`, 'info');
+      setTimeout(() => {
+        runSyncJob(job.id).catch(e => console.error('[startup run error]', e.message));
+      }, 2000 + jobs.indexOf(job) * 1500); // stagger slightly
+    }
+  }
+}
+
+// Update job schedule endpoint
+app.patch('/api/jobs/:id/schedule', (req, res) => {
+  const { schedule } = req.body;
+  const cfg = loadConfig();
+  const idx = cfg.syncJobs.findIndex(j => j.id === req.params.id);
+  if (idx === -1) return res.json({ success: false, message: 'Not found' });
+
+  // Validate custom cron
+  if (schedule && schedule !== 'manual' && !INTERVAL_PRESETS[schedule]) {
+    if (!cron.validate(schedule)) {
+      return res.json({ success: false, message: `Invalid cron expression: "${schedule}"` });
+    }
+  }
+
+  cfg.syncJobs[idx].schedule = schedule || 'manual';
+  cfg.syncJobs[idx].nextRun = getNextRun(cfg.syncJobs[idx]);
+  saveConfig(cfg);
+
+  registerJobSchedule(cfg.syncJobs[idx]);
+  broadcast({ type: 'jobUpdate', data: { id: req.params.id, schedule: cfg.syncJobs[idx].schedule, nextRun: cfg.syncJobs[idx].nextRun } });
+  res.json({ success: true, schedule: cfg.syncJobs[idx].schedule });
+});
+
+// Validate a cron expression
+app.post('/api/cron/validate', (req, res) => {
+  const { expr } = req.body;
+  if (!expr) return res.json({ valid: false, message: 'No expression provided' });
+  const valid = cron.validate(expr);
+  res.json({ valid, message: valid ? 'Valid cron expression' : 'Invalid cron expression' });
+});
+
+// Get presets
+app.get('/api/cron/presets', (req, res) => {
+  res.json(Object.entries(INTERVAL_PRESETS)
+    .filter(([k]) => k !== 'manual')
+    .map(([key, expr]) => ({ key, expr, label: describeSchedule(key) }))
+  );
+});
+
+function getNextRun(job) {
+  const expr = cronExprForJob(job);
+  if (!expr) return null;
+  try {
+    // node-cron doesn't expose nextDate natively, approximate it
+    const task = cron.schedule(expr, () => {}, { scheduled: false });
+    // Return a rough estimate based on the expression
+    return null; // node-cron v3 doesn't expose nextDate — use label only
+  } catch (_) { return null; }
+}
+
 // Logs
 app.get('/api/logs', (req, res) => { res.json(loadConfig().logs || []); });
 app.delete('/api/logs', (req, res) => { const cfg = loadConfig(); cfg.logs = []; saveConfig(cfg); res.json({ success: true }); });
@@ -463,4 +625,6 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
   addLog('Server started', 'info');
+  // Start scheduler after a short delay to let the server settle
+  setTimeout(initScheduler, 1000);
 });
