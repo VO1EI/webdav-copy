@@ -150,6 +150,73 @@ function parseSmbError(stderr, fallback) {
   return hit || lines[lines.length - 1] || fallback;
 }
 
+// ── SMB: write a local file to SMB share via smbclient CLI ──────────────────
+// More reliable than @marsaud/smb2 for actual file writes.
+// Writes a Buffer to a temp file, uploads it via smbclient, then cleans up.
+const os = require('os');
+function writeSmbFileCli(shareInfo, smbDestPath, buffer) {
+  return new Promise((resolve, reject) => {
+    const { host, share, username, password, domain } = shareInfo;
+    // Write buffer to a temp file
+    const tmpFile = path.join(os.tmpdir(), `smb_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    fs.writeFileSync(tmpFile, buffer);
+
+    // Convert forward slashes to backslashes, strip leading slash
+    const winPath = smbDestPath.replace(/\//g, '\\').replace(/^\\+/, '');
+    // smbclient put command: put localfile remotefile
+    const cmd = `put "${tmpFile}" "${winPath}"`;
+    const args = buildSmbArgs(host, share, username, password, domain, cmd);
+
+    execFile('smbclient', args, { timeout: 120000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      // Always clean up temp file
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+      if (err) {
+        const msg = parseSmbError(stderr, err.message);
+        reject(new Error(msg));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+// ── SMB: create directory via smbclient CLI ───────────────────────────────────
+function makeSmbDirCli(shareInfo, smbDirPath) {
+  return new Promise((resolve) => {
+    const { host, share, username, password, domain } = shareInfo;
+    const winPath = smbDirPath.replace(/\//g, '\\').replace(/^\\+/, '');
+    const cmd = `mkdir "${winPath}"`;
+    const args = buildSmbArgs(host, share, username, password, domain, cmd);
+    execFile('smbclient', args, { timeout: 15000 }, (err, stdout, stderr) => {
+      // Ignore "already exists" errors
+      if (err) {
+        const msg = parseSmbError(stderr, err.message);
+        if (!msg.includes('NT_STATUS_OBJECT_NAME_COLLISION') && !msg.includes('exist')) {
+          console.warn('[smbclient mkdir]', msg);
+        }
+      }
+      resolve(); // never reject — missing dir is caught on write
+    });
+  });
+}
+
+// ── SMB: check if path exists via smbclient CLI ───────────────────────────────
+function smbExistsCli(shareInfo, smbPath) {
+  return new Promise((resolve) => {
+    const { host, share, username, password, domain } = shareInfo;
+    const winPath = smbPath.replace(/\//g, '\\').replace(/^\\+/, '');
+    // Get the parent dir and look for the name
+    const parts = winPath.split('\\');
+    const name  = parts.pop();
+    const parentDir = parts.join('\\') || '';
+    const cmd = parentDir ? `cd "${parentDir}"; ls "${name}"` : `ls "${name}"`;
+    const args = buildSmbArgs(host, share, username, password, domain, cmd);
+    execFile('smbclient', args, { timeout: 10000 }, (err, stdout) => {
+      resolve(!err && stdout.includes(name));
+    });
+  });
+}
+
 // ── SMB: test connection via smbclient CLI ────────────────────────────────────
 function testSmbViaCli(host, share, username, password, domain) {
   return new Promise((resolve) => {
@@ -392,7 +459,6 @@ async function runSyncJob(jobId) {
   broadcast({ type: 'jobUpdate', data: { id: jobId, status: 'running' } });
   addLog(`Starting sync job "${job.name}"`, 'info');
 
-  let smb2 = null;
   let filesCopied = 0;
   let errors = 0;
 
@@ -401,25 +467,18 @@ async function runSyncJob(jobId) {
     const webdavClient = createClient(url, { username: wUser, password: wPass });
 
     addLog(`Connecting to SMB: \\\\${smbShareCfg.host}\\${smbShareCfg.share}`, 'info');
-    smb2 = createSmbClient(smbShareCfg);
 
-    // Promisified SMB ops
-    const smbWriteFile = promisify(smb2.writeFile.bind(smb2));
-    const smbMkdir    = promisify(smb2.mkdir.bind(smb2));
-    const smbReaddir  = promisify(smb2.readdir.bind(smb2));
-
-    // exists() returns bool via callback — wrap safely
-    const smbExists = (p) => new Promise(resolve => {
-      smb2.exists(p, (err, exists) => resolve(!err && !!exists));
-    });
-
-    // Verify SMB connection works before starting
-    try {
-      await smbReaddir('');
-      addLog('SMB connection verified OK', 'info');
-    } catch (e) {
-      throw new Error(`SMB connection failed: ${e.message}`);
+    // Test connection using smbclient CLI (reliable, gives real error messages)
+    const connTest = await testSmbViaCli(smbShareCfg.host, smbShareCfg.share, smbShareCfg.username, smbShareCfg.password, smbShareCfg.domain);
+    if (!connTest.success) {
+      throw new Error(`SMB connection failed: ${connTest.message}`);
     }
+    addLog(`SMB connected OK`, 'info');
+
+    // Use CLI-based helpers for all SMB operations — much more reliable than the Node SMB2 lib
+    const smbWrite  = (destPath, buf)  => writeSmbFileCli(smbShareCfg, destPath, buf);
+    const smbMkdir  = (dirPath)        => makeSmbDirCli(smbShareCfg, dirPath);
+    const smbExists = (checkPath)      => smbExistsCli(smbShareCfg, checkPath);
 
     // Allowed extensions (empty = all files)
     const allowedExts = (job.fileTypes || []).map(e => e.toLowerCase().replace(/^\./, ''));
@@ -526,7 +585,7 @@ async function runSyncJob(jobId) {
             const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
 
             addLog(`Writing to SMB: ${destPath} (${buf.length} bytes)`, 'debug');
-            await smbWriteFile(destPath, buf);
+            await smbWrite(destPath, buf);
             addLog(`OK: ${item.basename}`, 'info');
             filesCopied++;
             broadcast({ type: 'filesCopied', data: { jobId, count: filesCopied } });
@@ -559,8 +618,6 @@ async function runSyncJob(jobId) {
     const idx2 = cfg2.syncJobs.findIndex(j => j.id === jobId);
     if (idx2 !== -1) { cfg2.syncJobs[idx2].status = 'error'; cfg2.syncJobs[idx2].lastRun = new Date().toISOString(); saveConfig(cfg2); }
     broadcast({ type: 'jobUpdate', data: { id: jobId, status: 'error' } });
-  } finally {
-    closeSmbClient(smb2);
   }
 }
 
