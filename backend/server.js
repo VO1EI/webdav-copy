@@ -6,6 +6,8 @@ const path       = require('path');
 const os         = require('os');
 const { execFile } = require('child_process');
 const cron       = require('node-cron');
+const https      = require('https');
+const http       = require('http');
 
 const app = express();
 app.use(cors());
@@ -129,40 +131,56 @@ function browseSmbViaCli(host, share, username, password, domain, dirPath) {
 }
 
 // Write a Buffer to an SMB share via smbclient put
-function writeSmbFileCli(shareInfo, smbDestPath, buffer) {
+// Stream a WebDAV URL directly to a local temp file — no Buffer, no memory limit
+function streamToTempFile(url, username, password) {
+  return new Promise((resolve, reject) => {
+    const tmpFile = path.join(os.tmpdir(), `zs_dl_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    const fileStream = fs.createWriteStream(tmpFile);
+    const proto = url.startsWith('https') ? https : http;
+    const auth  = Buffer.from(`${username}:${password}`).toString('base64');
+    const req   = proto.get(url, { headers: { Authorization: `Basic ${auth}` } }, (res) => {
+      if (res.statusCode !== 200) {
+        fileStream.destroy();
+        try { fs.unlinkSync(tmpFile); } catch (_) {}
+        return reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
+      }
+      res.pipe(fileStream);
+      fileStream.on('finish', () => fileStream.close(() => resolve(tmpFile)));
+      fileStream.on('error', (e) => { try { fs.unlinkSync(tmpFile); } catch (_) {} reject(e); });
+    });
+    req.on('error', (e) => { try { fs.unlinkSync(tmpFile); } catch (_) {} reject(e); });
+    req.setTimeout(600000, () => { req.destroy(); reject(new Error('Download timed out')); });
+  });
+}
+
+// Upload a local file path to SMB — never loads into memory
+function writeSmbFileCli(shareInfo, smbDestPath, localFilePath) {
   return new Promise((resolve, reject) => {
     const { host, share, username, password, domain } = shareInfo;
-    const tmpFile = path.join(os.tmpdir(), `zs_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-    fs.writeFileSync(tmpFile, buffer);
     const winPath = smbDestPath.replace(/\//g, '\\').replace(/^\\+/, '');
-    const cmd  = `put "${tmpFile}" "${winPath}"`;
+    const cmd  = `put "${localFilePath}" "${winPath}"`;
     const args = buildSmbArgs(host, share, username, password, domain, cmd);
-    execFile('smbclient', args, { timeout: 300000, maxBuffer: 1024*1024 }, (err, stdout, stderr) => {
-      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    execFile('smbclient', args, { timeout: 600000, maxBuffer: 1024*1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(parseSmbError(stderr, err.message)));
       else     resolve();
     });
   });
 }
 
-// Read a file from an SMB share via smbclient get
+// Download a file from SMB to a local temp file path — returns the temp path
 function readSmbFileCli(shareInfo, smbSrcPath) {
   return new Promise((resolve, reject) => {
     const { host, share, username, password, domain } = shareInfo;
-    const tmpFile = path.join(os.tmpdir(), `zs_download_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    const tmpFile = path.join(os.tmpdir(), `zs_smb_${Date.now()}_${Math.random().toString(36).slice(2)}`);
     const winPath = smbSrcPath.replace(/\//g, '\\').replace(/^\\+/, '');
     const cmd  = `get "${winPath}" "${tmpFile}"`;
     const args = buildSmbArgs(host, share, username, password, domain, cmd);
-    execFile('smbclient', args, { timeout: 300000, maxBuffer: 1024*1024 }, (err, stdout, stderr) => {
+    execFile('smbclient', args, { timeout: 600000, maxBuffer: 1024*1024 }, (err, stdout, stderr) => {
       if (err) {
         try { fs.unlinkSync(tmpFile); } catch (_) {}
         reject(new Error(parseSmbError(stderr, err.message)));
       } else {
-        try {
-          const buf = fs.readFileSync(tmpFile);
-          fs.unlinkSync(tmpFile);
-          resolve(buf);
-        } catch (e) { reject(e); }
+        resolve(tmpFile); // return path, not buffer — caller must delete after use
       }
     });
   });
@@ -448,10 +466,18 @@ async function runSyncJob(jobId) {
               if (!job.overwrite && await smbExists(dest)) { addLog(`Skip (exists): ${item.basename}`, 'debug'); continue; }
               addLog(`Copying [${formatBytes(item.size)}]: ${item.filename}`, 'info');
               broadcast({ type: 'progress', data: { jobId, file: item.filename } });
-              const raw = await davClient.getFileContents(item.filename, { format: 'binary' });
-              const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-              await smbWrite(dest, buf);
-              addLog(`OK: ${item.basename}`, 'info');
+              // Stream directly to temp file — avoids 4 GB Buffer limit for large files
+              const { url: davUrl, username: davUser, password: davPass } = cfg.webdav;
+              const encodedPath = item.filename.split('/').map(s => encodeURIComponent(s)).join('/');
+              const fileUrl = `${davUrl.replace(/\/$/, '')}${encodedPath}`;
+              let tmpPath = null;
+              try {
+                tmpPath = await streamToTempFile(fileUrl, davUser, davPass);
+                await smbWrite(dest, tmpPath);
+                addLog(`OK: ${item.basename}`, 'info');
+              } finally {
+                if (tmpPath) try { fs.unlinkSync(tmpPath); } catch (_) {}
+              }
               filesCopied++;
               broadcast({ type: 'filesCopied', data: { jobId, count: filesCopied } });
             } catch (e) { errors++; addLog(`Error: ${item.filename}: ${e.message}`, 'error'); }
@@ -507,9 +533,15 @@ async function runSyncJob(jobId) {
               if (!job.overwrite && await smbExists(dest)) { addLog(`Skip (exists): ${item.name}`, 'debug'); continue; }
               addLog(`Copying [${formatBytes(item.size)}]: ${item.path}`, 'info');
               broadcast({ type: 'progress', data: { jobId, file: item.path } });
-              const buf = await readSmbFileCli(srcShare, item.path);
-              await smbWrite(dest, buf);
-              addLog(`OK: ${item.name}`, 'info');
+              // Download SMB→tempfile→SMB — no memory buffer, handles large files
+              let tmpPath = null;
+              try {
+                tmpPath = await readSmbFileCli(srcShare, item.path);
+                await smbWrite(dest, tmpPath);
+                addLog(`OK: ${item.name}`, 'info');
+              } finally {
+                if (tmpPath) try { fs.unlinkSync(tmpPath); } catch (_) {}
+              }
               filesCopied++;
               broadcast({ type: 'filesCopied', data: { jobId, count: filesCopied } });
             } catch (e) { errors++; addLog(`Error: ${item.path}: ${e.message}`, 'error'); }
